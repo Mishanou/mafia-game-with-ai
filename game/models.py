@@ -11,6 +11,10 @@ class PlayerType(enum.StrEnum):
     AI = "ai"
     HUMAN = "human"
 
+class ActionType(enum.StrEnum):
+    VOTE = "vote"
+    KILL = "kill"
+    ROLE_CHECK = "role_check"
 
 class Role(enum.StrEnum):
     MAFIA = "mafia"
@@ -25,7 +29,12 @@ class Role(enum.StrEnum):
         return mapping[self]
 
     @property
-    def action(self) -> ActionType:
+    def night_action(self) -> ActionType | None:
+        mapping = {
+            Role.MAFIA: ActionType.KILL,
+            Role.CITIZEN: None
+        }
+        return mapping[self]
 
 
 class Player(BaseModel):
@@ -33,7 +42,7 @@ class Player(BaseModel):
     player_type: PlayerType
     player_number: int
     is_alive: bool = True
-    system_prompt: str = None
+    system_prompt: str | None = None
 
 class GameStage(enum.StrEnum):
     DAY = "day"
@@ -59,10 +68,7 @@ class Message(BaseModel):
     stage: GameStage
     day_number: int
 
-class ActionType(enum.StrEnum):
-    VOTE = "vote"
-    KILL = "kill"
-    ROLE_CHECK = "role_check"
+
 
 
 class Action(BaseModel):
@@ -74,7 +80,6 @@ class Action(BaseModel):
 
 
 class GameEvent(BaseModel):
-    is_successful: bool = True
     action_type: ActionType
     stage: GameStage
     day_number: int

@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from .models import GameStage, Role, Player, PlayerType, Team, Message, Action, ActionType, GameEvent
 from player_actions.human_input import get_human_answer
 from player_actions.ai_client import get_ai_answer
+from collections import Counter
 
 
 class Game (BaseModel):
@@ -16,8 +17,16 @@ class Game (BaseModel):
     game_events: list[GameEvent] = Field(default_factory=list)
 
     @property
-    def alive_player(self) -> list[Player]:
+    def alive_players(self) -> list[Player]:
         return [p for p in self.players if p.is_alive]
+
+    @property
+    def current_actions(self) -> list[Action]:
+        return [a for a in self.actions if a.day_number == self.day_number and a.stage == self.stage]
+
+    @property
+    def current_game_events(self) -> list[GameEvent]:
+        return [ge for ge in self.game_events if ge.day_number == self.day_number and ge.stage == self.stage]
 
     def distribute_roles_and_types(self) -> None:
         if self.players or not self.roles:
@@ -71,39 +80,55 @@ class Game (BaseModel):
              text_list.append(f"[{m.stage} {m.day_number}] {m.player.player_number}: {m.text}")
         return "\n".join(text_list)
 
+    def _get_raw_answer(self, player) -> str:
+        if player.player_type == PlayerType.AI:
+            return get_ai_answer(prompt=self.make_text(player.role.team), system_prompt=player.system_prompt)
+        return get_human_answer()
+
+    def _get_player(self, player_number) -> Player:
+        for p in self.players:
+            if p.player_number == player_number:
+                return p
 
     def get_player_answer(self, player: Player) -> Message:
-        if player.player_type == PlayerType.AI:
-            content = get_ai_answer(prompt=self.make_text(player.role.team), system_prompt=player.system_prompt)
-        else:
-            content = get_human_answer()
-
+        content = self._get_raw_answer(player)
         return Message(text=content, stage=self.stage, player=player, day_number=self.day_number)
 
-    def get_player_action(self, action_type: ActionType, player: Player):
-        if player.player_type == PlayerType.AI:
-            content = get_ai_answer(prompt=self.make_text(player.role.team), system_prompt=player.system_prompt)
-        else:
-            content = get_human_answer()
+    def get_player_action(self, action_type: ActionType, player: Player) -> Action:
+        content = self._get_raw_answer(player)
         try:
-            target = int(content)
+            target = self._get_player(int(content))
+            if target is None:
+                raise ValueError
+            return Action(stage=self.stage, player=player, day_number=self.day_number, target=target,
+                          action_type=action_type)
         except ValueError:
             print("Повторите попытку.")
-            self.get_player_action(action_type, player)
-        return Action(stage=self.stage, player=player, day_number=self.day_number)
+            return self.get_player_action(action_type, player)
 
-    def execute_game_event(self, action_type: ActionType, target_player: Player) -> None:
-        if action_type in [ActionType.KILL, ActionType.VOTE]:
-            target_player.is_alive = False
-        self.game_events.append(GameEvent(action_type=action_type, stage=self.stage, day_number=self.day_number, target=target_player))
+    def get_game_events(self):
+        if self.stage == GameStage.DAY:
+            votes = Counter([a.target for a in self.current_actions])
+            target_player = max(votes, key=votes.get)
+            self.game_events.append(GameEvent(action_type=ActionType.VOTE, stage=self.stage, day_number=self.day_number, target=target_player))
+
+
+    def execute_game_events(self) -> None:
+        if self.stage == GameStage.DAY:
+            self.current_game_events[0].target.is_alive = False
 
 
 
-    def process_day(self):
-        for p in self.alive_player:
+
+    def process_day(self) -> None:
+        for p in self.alive_players:
             self.messages.append(self.get_player_answer(p))
 
-        for p in self.players:
+        for p in self.alive_players:
+            self.actions.append(self.get_player_action(action_type=ActionType.VOTE, player=p))
+
+        self.get_game_events()
+        self.execute_game_events()
 
 
     def process_night(self):

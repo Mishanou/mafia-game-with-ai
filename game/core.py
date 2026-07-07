@@ -1,6 +1,6 @@
 import random
 from pydantic import BaseModel, Field
-from .models import GameStage, Role, Player, PlayerType, Team, Message, Action, ActionType, GameEvent
+from .models import GameStage, Role, Player, PlayerType, Team, Message, Action, ActionType, GameEvent, ChannelType
 from player_actions.human_input import get_human_answer
 from player_actions.ai_client import get_ai_answer
 from collections import Counter
@@ -69,20 +69,17 @@ class Game (BaseModel):
         else:
             return None
 
-    def make_text(self, team) -> str:
+    def make_text(self, player) -> str:
+        channel_messages = [m for m in self.messages if m.channel in player.role.channels]
         text_list = []
-        if team == Team.CITIZENS:
-            team_messages = [m for m in self.messages if m.stage == GameStage.DAY]
-        else:
-            team_messages = self.messages
 
-        for m in team_messages:
+        for m in channel_messages:
              text_list.append(f"[{m.stage} {m.day_number}] {m.player.player_number}: {m.text}")
         return "\n".join(text_list)
 
     def _get_raw_answer(self, player) -> str:
         if player.player_type == PlayerType.AI:
-            return get_ai_answer(prompt=self.make_text(player.role.team), system_prompt=player.system_prompt)
+            return get_ai_answer(prompt=self.make_text(player), system_prompt=player.system_prompt)
         return get_human_answer()
 
     def _get_player(self, player_number) -> Player:
@@ -90,9 +87,31 @@ class Game (BaseModel):
             if p.player_number == player_number:
                 return p
 
-    def get_player_answer(self, player: Player) -> Message:
+    def get_players_in_night_channel(self, channel: ChannelType) -> list[Player]:
+        return [
+            p for p in self.alive_players
+            if channel in p.role.night_channels and p.role.night_action is not None
+        ]
+
+    def get_active_night_channels(self) -> dict[ChannelType, list[Player]]:
+        channels: dict[ChannelType, list[Player]] = {}
+        for player in self.alive_players:
+            if player.role.night_action is None:
+                continue
+            channel = player.role.night_channel
+            if channel is None:
+                continue
+            channels.setdefault(channel, []).append(player)
+        return channels
+
+    def get_player_answer(self, player: Player, channel: ChannelType) -> Message:
         content = self._get_raw_answer(player)
-        return Message(text=content, stage=self.stage, player=player, day_number=self.day_number)
+        return Message(
+            text=content,
+            stage=self.stage,
+            player=player,
+            day_number=self.day_number,
+            channel=channel)
 
     def get_player_action(self, action_type: ActionType, player: Player) -> Action:
         content = self._get_raw_answer(player)
@@ -106,30 +125,95 @@ class Game (BaseModel):
             print("Повторите попытку.")
             return self.get_player_action(action_type, player)
 
-    def get_game_events(self):
-        if self.stage == GameStage.DAY:
-            votes = Counter([a.target for a in self.current_actions])
-            target_player = max(votes, key=votes.get)
-            self.game_events.append(GameEvent(action_type=ActionType.VOTE, stage=self.stage, day_number=self.day_number, target=target_player))
-
 
     def execute_game_events(self) -> None:
         if self.stage == GameStage.DAY:
-            self.current_game_events[0].target.is_alive = False
+            for event in self.current_game_events:
+                event.target.is_alive = False
+        else:
+            heals = [ge.target for ge in self.current_game_events if ge.action_type==ActionType.HEAL]
+            target_kills = [ge.target for ge in self.current_game_events if ge.action_type==ActionType.KILL and ge.target not in heals]
+            checks = [ge.target for ge in self. current_game_events if ge.action_type==ActionType.ROLE_CHECK]
+            for t in target_kills:
+                t.is_alive = False
+            for c in checks:
 
 
 
+
+    def resolve_day_vote(self) -> None:
+        abstain_count = sum(1 for a in self.current_actions if a.target is None)
+        votes = Counter(a.target.player_number for a in self.current_actions if a.target is not None)
+
+        if not votes:
+            return  # все воздержались
+
+        top_count = max(votes.values())
+
+        if abstain_count >= top_count:
+            return  # воздержание побеждает — никого не линчуют
+
+        top_numbers = [number for number, count in votes.items() if count == top_count]
+
+        for number in top_numbers:
+            target_player = self._get_player(number)
+            self.game_events.append(GameEvent(
+                action_type=ActionType.VOTE,
+                stage=self.stage,
+                day_number=self.day_number,
+                target=target_player,
+            ))
 
     def process_day(self) -> None:
         for p in self.alive_players:
-            self.messages.append(self.get_player_answer(p))
+            self.messages.append(self.get_player_answer(player=p, channel=ChannelType.DAY))
 
         for p in self.alive_players:
             self.actions.append(self.get_player_action(action_type=ActionType.VOTE, player=p))
 
-        self.get_game_events()
+        self.resolve_day_vote()
         self.execute_game_events()
 
 
+    def _process_night_channel(self, channel: ChannelType, players: list[Player]) -> None:
+        # 1. Дискуссия — только если в канале > 1 игрока
+        if len(players) > 1:
+            for player in players:
+                message = self.get_player_answer(player, channel=channel)
+                self.messages.append(message)
+
+        for player in players:
+            action_type = player.role.night_action
+            action = self.get_player_action(action_type, player)
+            self.actions.append(action)
+
+
+    def resolve_night_actions(self) -> None:
+        if self.current_actions:
+            mafia_votes = Counter(a.target.player_number for a in self.current_actions if a.player.role.team == Team.MAFIA and a.action_type==ActionType.KILL and a.target is not None)
+            top_votes = mafia_votes.most_common()
+            if top_votes:
+                if len(top_votes) > 1 and top_votes[0][1] == top_votes[1][1]:
+                    return  # ничья — никто не убит (опционально)
+                kill_target = top_votes[0][0]
+                self.game_events.append(GameEvent(target=self._get_player(kill_target), stage=self.stage, day_number=self.day_number, action_type=ActionType.KILL))
+
+            not_mafia_actions = [a for a in self.current_actions if a.player.role.team!=Team.MAFIA and a.target is not None]
+            for a in not_mafia_actions:
+                self.game_events.append(GameEvent(action_type=a.action_type, target=a.target, stage=a.stage, day_number=a.day_number))
+
     def process_night(self):
-        pass
+        for channel, players in self.get_active_night_channels().items():
+            self._process_night_channel(channel, players)
+
+        self.resolve_night_actions()
+        self.execute_game_events()
+
+
+
+
+
+        # for p in [p for p in self.alive_players if p.role.night_action is not None]:
+        #     self.actions.append(self.get_player_action(action_type=p.role.night_action, player=p))
+
+

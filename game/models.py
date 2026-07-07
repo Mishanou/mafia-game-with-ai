@@ -15,16 +15,27 @@ class ActionType(enum.StrEnum):
     VOTE = "vote"
     KILL = "kill"
     ROLE_CHECK = "role_check"
+    HEAL = "heal"
+
+class ChannelType(enum.StrEnum):
+    DAY = "day"
+    MAFIA_NIGHT = "mafia_night"
+    PRIVATE = "private"
+
 
 class Role(enum.StrEnum):
     MAFIA = "mafia"
     CITIZEN = "citizen"
+    DOCTOR = "DOCTOR"
+    SHERIFF = "sheriff"
 
     @property
     def team(self) -> Team:
         mapping = {
             Role.MAFIA: Team.MAFIA,
             Role.CITIZEN: Team.CITIZENS,
+            Role.DOCTOR: Team.CITIZENS,
+            Role.SHERIFF: Team.CITIZENS
         }
         return mapping[self]
 
@@ -32,10 +43,31 @@ class Role(enum.StrEnum):
     def night_action(self) -> ActionType | None:
         mapping = {
             Role.MAFIA: ActionType.KILL,
-            Role.CITIZEN: None
+            Role.CITIZEN: None,
+            Role.SHERIFF: ActionType.ROLE_CHECK,
+            Role.DOCTOR: ActionType.HEAL
         }
         return mapping[self]
 
+    @property
+    def channels(self) -> list[ChannelType]:
+        mapping = {
+            Role.MAFIA: [ChannelType.DAY, ChannelType.MAFIA_NIGHT],
+            Role.CITIZEN: [ChannelType.DAY],
+            Role.DOCTOR: [ChannelType.DAY, ChannelType.PRIVATE],
+            Role.SHERIFF: [ChannelType.DAY, ChannelType.PRIVATE]
+        }
+        return mapping[self]
+
+    @property
+    def night_channels(self) -> list[ChannelType]:
+        return [c for c in self.channels if c!= ChannelType.DAY]
+
+    @property
+    def night_channel(self) -> ChannelType | None:
+        """Один канал, где игрок действует ночью (для группировки)."""
+        channels = self.night_channels
+        return channels[0] if channels else None
 
 class Player(BaseModel):
     role: Role
@@ -48,21 +80,11 @@ class GameStage(enum.StrEnum):
     DAY = "day"
     NIGHT = "night"
 
-# class ChannelType(enum.StrEnum):
-#     DAY = "day"
-#     MAFIA_NIGHT = "mafia_night"
-#     NEUTRAL_NIGHT = "neutral_night"
-#
-#     def channel(self) -> Team:
-#         mapping = {
-#             ChannelType.DAY: Team.CITIZENS,
-#             ChannelType.MAFIA_NIGHT: Team.MAFIA,
-#             Role.CITIZEN: Team.CITIZENS,
-#         }
-#         return mapping[self]
+
+
 
 class Message(BaseModel):
-    # channel: ChannelType
+    channel: ChannelType
     text: str
     player: Player
     stage: GameStage
@@ -76,7 +98,7 @@ class Action(BaseModel):
     stage: GameStage
     day_number: int
     player: Player
-    target: Player
+    target: Player | None = None
 
 
 class GameEvent(BaseModel):

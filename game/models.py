@@ -26,7 +26,7 @@ class ChannelType(enum.StrEnum):
 class Role(enum.StrEnum):
     MAFIA = "mafia"
     CITIZEN = "citizen"
-    DOCTOR = "DOCTOR"
+    DOCTOR = "doctor"
     SHERIFF = "sheriff"
 
     @property
@@ -86,7 +86,8 @@ class GameStage(enum.StrEnum):
 class Message(BaseModel):
     channel: ChannelType
     text: str
-    player: Player
+    player: Player | None = None  # Кто отправил (None для системы)
+    recipient: Player | None = None  # Кому адресовано (для приватных шепотов)
     stage: GameStage
     day_number: int
 
@@ -106,3 +107,4 @@ class GameEvent(BaseModel):
     stage: GameStage
     day_number: int
     target: Player
+    player: Player | None = None  # <--- Инициатор события (кто совершил действие)

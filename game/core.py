@@ -1,14 +1,15 @@
 import random
 from pydantic import BaseModel, Field
 from .models import GameStage, Role, Player, PlayerType, Team, Message, Action, ActionType, GameEvent, ChannelType
-from player_actions.human_input import get_human_answer
-from player_actions.ai_client import get_ai_answer
+from .player_actions.human_input import get_human_answer
+from .player_actions.ai_client import get_ai_answer
 from collections import Counter
+from .prompts.prompt_builder import PromptBuilder
 
 
 class Game (BaseModel):
-    stage: GameStage = GameStage.NIGHT
-    day_number: int = 0
+    stage: GameStage = GameStage.DAY
+    day_number: int = 1
     roles: dict[Role, int]
     messages: list[Message] = Field(default_factory=list)
     players: list[Player] = Field(default_factory=list)
@@ -39,9 +40,20 @@ class Game (BaseModel):
         human_player_number = random.randint(1, len(roles_list))
         random.shuffle(roles_list)
         for i, role in enumerate(roles_list):
-            player_type = PlayerType.HUMAN if i+1==human_player_number else PlayerType.AI
-            player = Player(player_number=i+1, role=role, player_type=player_type)
+            player_type = PlayerType.HUMAN if i + 1 == human_player_number else PlayerType.AI
+            player = Player(player_number=i + 1, role=role, player_type=player_type)
+
+            # ЗАГРУЗКА СИСТЕМНОГО ПРОМПТА:
+            if player_type == PlayerType.AI:
+                player.system_prompt = PromptBuilder.get_system_prompt(player)
+
             self.players.append(player)
+
+        human = next((p for p in self.players if p.player_type == PlayerType.HUMAN), None)
+        if human:
+            print(f"\n🎮 Игра началась! Вы — Игрок {human.player_number}.")
+            print(f"Ваша роль: {human.role.value.upper()} (Команда: {human.role.team.value})")
+            print("--------------------------------------------------\n")
 
     def change_stage(self) -> None:
         if self.check_win_cons():
@@ -77,9 +89,12 @@ class Game (BaseModel):
              text_list.append(f"[{m.stage} {m.day_number}] {m.player.player_number}: {m.text}")
         return "\n".join(text_list)
 
-    def _get_raw_answer(self, player) -> str:
+    def _get_raw_answer(self, player: Player, action_type: ActionType | None = None) -> str:
         if player.player_type == PlayerType.AI:
-            return get_ai_answer(prompt=self.make_text(player), system_prompt=player.system_prompt)
+            # Формируем динамический user prompt на основе состояния игры
+            user_prompt = PromptBuilder.get_user_prompt(self, player, action_type)
+            return get_ai_answer(prompt=user_prompt, system_prompt=player.system_prompt)
+
         return get_human_answer()
 
     def _get_player(self, player_number) -> Player:
@@ -93,52 +108,129 @@ class Game (BaseModel):
             if channel in p.role.night_channels and p.role.night_action is not None
         ]
 
-    def get_active_night_channels(self) -> dict[ChannelType, list[Player]]:
-        channels: dict[ChannelType, list[Player]] = {}
+    def get_active_night_channels(self) -> dict[any, list[Player]]:
+        channels: dict[any, list[Player]] = {}
         for player in self.alive_players:
             if player.role.night_action is None:
                 continue
             channel = player.role.night_channel
             if channel is None:
                 continue
-            channels.setdefault(channel, []).append(player)
+
+            # Если канал приватный, он уникален для каждого игрока,
+            # чтобы Доктор и Шериф не пересекались
+            if channel == ChannelType.PRIVATE:
+                key = f"private_{player.player_number}"
+            else:
+                key = channel
+
+            channels.setdefault(key, []).append(player)
         return channels
 
     def get_player_answer(self, player: Player, channel: ChannelType) -> Message:
-        content = self._get_raw_answer(player)
-        return Message(
+        # Получаем ответ (передаем action_type=None, так как это просто беседа)
+        content = self._get_raw_answer(player, action_type=None)
+
+        message = Message(
             text=content,
             stage=self.stage,
             player=player,
             day_number=self.day_number,
-            channel=channel)
+            channel=channel
+        )
+
+        # Проверяем, должен ли человек-игрок видеть это сообщение прямо сейчас
+        human = next((p for p in self.players if p.player_type == PlayerType.HUMAN), None)
+        if human:
+            # Условия видимости:
+            # 1. Это дневной чат (его мы и так выводим на экран в process_day)
+            # 2. Это приватное сообщение лично человеку (например, отчет Шерифа)
+            # 3. Это чат мафии, и человек играет за мафию
+            is_visible = (channel == ChannelType.DAY) or \
+                         (channel == ChannelType.PRIVATE and message.recipient == human) or \
+                         (channel == ChannelType.MAFIA_NIGHT and human.role.team == Team.MAFIA)
+
+            # Выводим в консоль только ночные/приватные сообщения, чтобы избежать дублирования дневных
+            if is_visible and channel != ChannelType.DAY:
+                sender = f"Игрок {player.player_number}" if player else "Система"
+                print(f"💬 [{channel.value.upper()}] {sender}: {message.text}")
+
+        return message
+
 
     def get_player_action(self, action_type: ActionType, player: Player) -> Action:
-        content = self._get_raw_answer(player)
+        content = self._get_raw_answer(player, action_type=action_type)
         try:
-            target = self._get_player(int(content))
-            if target is None:
-                raise ValueError
+            val = int(content)
+
+            if val == 0:
+                # 0 — это легальный выбор (воздержаться). Цель будет None.
+                target = None
+            else:
+                target = self._get_player(val)
+                # Если ввели число, которого нет в игре (например, 99)
+                if target is None:
+                    raise ValueError
+
             return Action(stage=self.stage, player=player, day_number=self.day_number, target=target,
                           action_type=action_type)
         except ValueError:
             print("Повторите попытку.")
             return self.get_player_action(action_type, player)
 
-
     def execute_game_events(self) -> None:
         if self.stage == GameStage.DAY:
             for event in self.current_game_events:
                 event.target.is_alive = False
+                print(f"💀 Игрок {event.target.player_number} изгнан голосованием жителей!")
+
+                # Записываем изгнание в историю дневного чата:
+                self.messages.append(Message(
+                    channel=ChannelType.DAY,
+                    text=f"Игрок {event.target.player_number} был изгнан голосованием жителей.",
+                    player=None,  # None = Система
+                    stage=self.stage,
+                    day_number=self.day_number
+                ))
         else:
-            heals = [ge.target for ge in self.current_game_events if ge.action_type==ActionType.HEAL]
-            target_kills = [ge.target for ge in self.current_game_events if ge.action_type==ActionType.KILL and ge.target not in heals]
-            checks = [ge.target for ge in self. current_game_events if ge.action_type==ActionType.ROLE_CHECK]
+            heals = [ge.target for ge in self.current_game_events if ge.action_type == ActionType.HEAL]
+            target_kills = [ge.target for ge in self.current_game_events if
+                            ge.action_type == ActionType.KILL and ge.target not in heals]
+
+            print(f"\n=== НАСТУПАЕТ УТРО ДНЯ {self.day_number + 1} ===")
             for t in target_kills:
                 t.is_alive = False
-            for c in checks:
+                print(f"💀 Ночью был убит Игрок {t.player_number}!")
+                # Записываем ночную смерть в историю дневного чата:
+                self.messages.append(Message(
+                    channel=ChannelType.DAY,
+                    text=f"Игрок {t.player_number} найден мертвым этим утром.",
+                    player=None,  # None = Система
+                    stage=self.stage,
+                    day_number=self.day_number
+                ))
+            if not target_kills:
+                print("💖 Ночь прошла спокойно. Никто не погиб.")
 
-
+            # Обработка проверок Шерифа (из предыдущего ответа)
+            checks = [ge for ge in self.current_game_events if ge.action_type == ActionType.ROLE_CHECK]
+            for ge in checks:
+                sheriff = ge.player
+                target = ge.target
+                if sheriff and sheriff.is_alive:
+                    team_name = "Мафия" if target.role.team == Team.MAFIA else "Мирный житель"
+                    result_text = f"Результат проверки: Игрок {target.player_number} — {team_name}."
+                    self.messages.append(Message(
+                        channel=ChannelType.PRIVATE,
+                        text=result_text,
+                        player=None,
+                        recipient=sheriff,
+                        stage=self.stage,
+                        day_number=self.day_number
+                    ))
+                    # Если Шериф — человек, выводим проверку прямо на экран
+                    if sheriff.player_type == PlayerType.HUMAN:
+                        print(f"🔍 [Секретно] {result_text}")
 
 
     def resolve_day_vote(self) -> None:
@@ -165,18 +257,27 @@ class Game (BaseModel):
             ))
 
     def process_day(self) -> None:
-        for p in self.alive_players:
-            self.messages.append(self.get_player_answer(player=p, channel=ChannelType.DAY))
+        print(f"\n=== ДЕНЬ {self.day_number} ===")
+        print("Игроки начинают обсуждение:")
 
+        for p in self.alive_players:
+            message = self.get_player_answer(player=p, channel=ChannelType.DAY)
+            self.messages.append(message)
+            # Выводим реплику каждого игрока в консоль
+            print(f"Игрок {p.player_number}: {message.text}")
+
+        print("\nНачинается голосование...")
         for p in self.alive_players:
             self.actions.append(self.get_player_action(action_type=ActionType.VOTE, player=p))
 
         self.resolve_day_vote()
         self.execute_game_events()
 
+    def _process_night_channel(self, channel_key, players: list[Player]) -> None:
+        # Определяем реальный тип канала для сообщений
+        channel = ChannelType.PRIVATE if str(channel_key).startswith("private_") else channel_key
 
-    def _process_night_channel(self, channel: ChannelType, players: list[Player]) -> None:
-        # 1. Дискуссия — только если в канале > 1 игрока
+        # Дискуссия — только если в канале реально > 1 игрока (например, в чате мафии)
         if len(players) > 1:
             for player in players:
                 message = self.get_player_answer(player, channel=channel)
@@ -200,11 +301,12 @@ class Game (BaseModel):
 
             not_mafia_actions = [a for a in self.current_actions if a.player.role.team!=Team.MAFIA and a.target is not None]
             for a in not_mafia_actions:
-                self.game_events.append(GameEvent(action_type=a.action_type, target=a.target, stage=a.stage, day_number=a.day_number))
+                self.game_events.append(GameEvent(action_type=a.action_type, target=a.target, stage=a.stage, day_number=a.day_number, player=a.player))
 
     def process_night(self):
-        for channel, players in self.get_active_night_channels().items():
-            self._process_night_channel(channel, players)
+        # Передаем ключ канала вместо строгого типа ChannelType
+        for channel_key, players in self.get_active_night_channels().items():
+            self._process_night_channel(channel_key, players)
 
         self.resolve_night_actions()
         self.execute_game_events()

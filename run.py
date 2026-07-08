@@ -1,10 +1,8 @@
 # Если файлы лежат в одной папке, импортируем без точек:
-from .core import Game
-from .models import Role, GameStage
+from game.core import Game
+from game.models import Role, GameStage
 
 if __name__ == '__main__':
-    # Настраиваем количество ролей (например: 1 мафия, 1 шериф, 1 доктор, 2 гражданина)
-    # Итого 5 игроков. Один из них будет человеком.
     game = Game(roles={
         Role.MAFIA: 2,
         Role.SHERIFF: 1,
